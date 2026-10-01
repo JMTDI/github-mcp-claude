@@ -4,16 +4,23 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 GITHUB_API = "https://api.github.com"
 
 mcp = MCPServer("github")
 
 
+class GitHubAPIError(ToolError):
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        super().__init__(message)
+
+
 def get_github_token() -> str:
     token = os.getenv("GITHUB_TOKEN")
     if not token:
-        raise RuntimeError(
+        raise ToolError(
             "Missing GITHUB_TOKEN environment variable. "
             "Generate a GitHub PAT with repo access and set it before running the server."
         )
@@ -21,54 +28,75 @@ def get_github_token() -> str:
 
 
 def github_headers() -> Dict[str, str]:
-    return {
+    headers = {
         "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {get_github_token()}",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "claude-github-mcp-server",
     }
+    header_name = "Authorization"
+    auth_scheme = "Bearer"
+    token = get_github_token()
+    headers[header_name] = " ".join((auth_scheme, token))
+    return headers
+
+
+def github_request(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Any:
+    try:
+        response = requests.request(
+            method,
+            f"{GITHUB_API}{path}",
+            headers=github_headers(),
+            params=params,
+            json=payload,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise ToolError(
+            f"GitHub API {method} {path} request failed "
+            f"({type(exc).__name__}); check network connectivity and token configuration."
+        ) from None
+
+    if response.status_code >= 400:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        message = data.get("message") if isinstance(data, dict) else None
+        errors = data.get("errors") if isinstance(data, dict) else None
+        details = f": {message}" if message else ""
+        if errors:
+            details += f" ({errors})"
+        raise GitHubAPIError(
+            response.status_code,
+            f"GitHub API {method} {path} failed "
+            f"({response.status_code}){details}",
+        )
+
+    if not response.content:
+        return {}
+    try:
+        return response.json()
+    except ValueError:
+        raise ToolError(
+            f"GitHub API {method} {path} returned an invalid JSON response."
+        ) from None
 
 
 def github_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    response = requests.get(
-        f"{GITHUB_API}{path}",
-        headers=github_headers(),
-        params=params,
-        timeout=30,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"GitHub API GET {path} failed: {response.status_code} {response.text}"
-        )
-    return response.json() if response.content else {}
+    return github_request("GET", path, params=params)
 
 
 def github_post(path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
-    response = requests.post(
-        f"{GITHUB_API}{path}",
-        headers=github_headers(),
-        json=payload,
-        timeout=30,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"GitHub API POST {path} failed: {response.status_code} {response.text}"
-        )
-    return response.json() if response.content else {}
+    return github_request("POST", path, payload=payload)
 
 
 def github_put(path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
-    response = requests.put(
-        f"{GITHUB_API}{path}",
-        headers=github_headers(),
-        json=payload,
-        timeout=30,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"GitHub API PUT {path} failed: {response.status_code} {response.text}"
-        )
-    return response.json() if response.content else {}
+    return github_request("PUT", path, payload=payload)
 
 
 def github_default_branch(owner: str, repo: str) -> str:
@@ -91,19 +119,24 @@ def github_list_contents(owner: str, repo: str, path: str = "") -> List[Dict[str
 
 
 @mcp.tool()
-def github_read_file(owner: str, repo: str, path: str, ref: Optional[str] = None) -> Dict[str, Any]:
+def github_read_file(
+    owner: str, repo: str, path: str, ref: Optional[str] = None
+) -> Dict[str, Any]:
     """Read a file from a public or private repo. Returns the decoded file content."""
     params = {"ref": ref} if ref else None
     data = github_get(f"/repos/{owner}/{repo}/contents/{path}", params=params)
 
     if isinstance(data, list):
-        raise ValueError(f"Path '{path}' points to a directory, not a file.")
+        raise ToolError(f"Path '{path}' points to a directory, not a file.")
 
     if data.get("type") != "file":
-        raise ValueError(f"Path '{path}' is not a file.")
+        raise ToolError(f"Path '{path}' is not a file.")
 
     content_b64 = data.get("content", "")
-    decoded = base64.b64decode(content_b64).decode("utf-8") if content_b64 else ""
+    try:
+        decoded = base64.b64decode(content_b64).decode("utf-8") if content_b64 else ""
+    except (ValueError, UnicodeDecodeError):
+        raise ToolError(f"File '{path}' is not valid UTF-8 text.") from None
 
     return {
         "path": path,
@@ -148,7 +181,9 @@ def github_create_or_update_file(
             f"/repos/{owner}/{repo}/contents/{path}",
             params={"ref": target_branch},
         )
-    except Exception:
+    except GitHubAPIError as exc:
+        if exc.status_code != 404:
+            raise
         existing = None
 
     payload: Dict[str, Any] = {
@@ -164,7 +199,9 @@ def github_create_or_update_file(
 
 
 @mcp.tool()
-def github_create_issue(owner: str, repo: str, title: str, body: str = "") -> Dict[str, Any]:
+def github_create_issue(
+    owner: str, repo: str, title: str, body: str = ""
+) -> Dict[str, Any]:
     """Create an issue in a repo if the token has permission."""
     payload = {"title": title, "body": body}
     return github_post(f"/repos/{owner}/{repo}/issues", payload)
